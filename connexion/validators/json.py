@@ -33,7 +33,6 @@ class JSONRequestBodyValidator:
         self.nullable = nullable
         self.validator = validator(schema, format_checker=draft4_format_checker)
         self.encoding = encoding
-        self._messages: t.List[t.MutableMapping[str, t.Any]] = []
 
     @classmethod
     def _error_path_message(cls, exception):
@@ -55,27 +54,60 @@ class JSONRequestBodyValidator:
     @staticmethod
     def parse(body: str) -> dict:
         try:
+            # TODO: make json library pluggable
             return json.loads(body)
         except json.decoder.JSONDecodeError as e:
             raise BadRequestProblem(str(e))
 
-    async def wrapped_receive(self) -> Receive:
+    async def read_body(self) -> t.Tuple[str, int]:
+        """Read the body from the receive channel.
+
+        :return: A tuple (body, max_length) where max_length is the length of the larges message.
+        """
         more_body = True
+        max_length = 256000
+        messages = []
         while more_body:
             message = await self._receive()
-            self._messages.append(message)
+            max_length = max(max_length, len(message.get("body", b"")))
+            messages.append(message)
             more_body = message.get("more_body", False)
 
-        bytes_body = b"".join([message.get("body", b"") for message in self._messages])
-        decoded_body = bytes_body.decode(self.encoding)
+        bytes_body = b"".join([message.get("body", b"") for message in messages])
 
+        return bytes_body.decode(self.encoding), max_length
+
+    async def wrapped_receive(self) -> Receive:
+        """Receive channel to pass on to next ASGI application."""
+        decoded_body, max_length = await self.read_body()
+
+        # Validate the body if not null
         if decoded_body and not (self.nullable and is_null(decoded_body)):
             body = self.parse(decoded_body)
+            del decoded_body
             self.validate(body)
+            # TODO: make json library pluggable
+            str_body = json.dumps(body)
+        else:
+            str_body = decoded_body
+
+        bytes_body = str_body.encode(self.encoding)
+        del str_body
+
+        # Recreate ASGI messages from validated body so changes made by the validator are propagated
+        messages = [
+            {
+                "type": "http.request",
+                "body": bytes_body[i : i + max_length],
+                "more_body": i + max_length < len(body),
+            }
+            for i in range(0, len(body), max_length)
+        ]
+        del body
 
         async def receive() -> t.MutableMapping[str, t.Any]:
-            while self._messages:
-                return self._messages.pop(0)
+            while messages:
+                return messages.pop(0)
             return await self._receive()
 
         return receive

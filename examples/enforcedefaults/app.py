@@ -37,6 +37,7 @@ validator_map = {"body": {"application/json": DefaultsEnforcingRequestBodyValida
 
 
 app = connexion.AsyncApp(__name__, specification_dir="spec")
+app.add_api("openapi.yaml", validator_map=validator_map)
 app.add_api("swagger.yaml", validator_map=validator_map)
 
 
